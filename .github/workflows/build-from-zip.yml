@@ -1,9 +1,11 @@
-name: Build SorenWare APK
+name: Build SorenWare from ZIP
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    paths:
+      - "*.zip"
+      - ".github/workflows/build-from-zip.yml"
 
 permissions:
   contents: read
@@ -11,27 +13,107 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v6
+
+      - name: Find project ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t zips < <(find . -maxdepth 1 -type f -iname "*.zip" -print)
+
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "ERROR: No project ZIP found in repository root."
+            echo "Upload one .zip file to the repository root."
+            exit 1
+          fi
+
+          if [ "${#zips[@]}" -gt 1 ]; then
+            echo "ERROR: More than one ZIP was found:"
+            printf '%s\n' "${zips[@]}"
+            echo "Keep only the project ZIP you want to build."
+            exit 1
+          fi
+
+          ZIP_PATH="${zips[0]}"
+          echo "zip_path=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
+          echo "Using: ${ZIP_PATH}"
+
+      - name: Extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf project
+          mkdir -p project
+          unzip -q "${{ steps.zip.outputs.zip_path }}" -d project
+
+          echo "Extracted files:"
+          find project -maxdepth 4 -type f | sort | head -200
+
+      - name: Locate Gradle project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SETTINGS="$(find project -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) -print -quit)"
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: Could not find settings.gradle or settings.gradle.kts inside the ZIP."
+            echo "The ZIP must contain a complete Android Gradle project."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Gradle project found at: $PROJECT_DIR"
+
+          if [ ! -f "$PROJECT_DIR/build.gradle" ] && [ ! -f "$PROJECT_DIR/build.gradle.kts" ]; then
+            echo "ERROR: Root build.gradle or build.gradle.kts was not found."
+            exit 1
+          fi
+
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "ERROR: app/ directory was not found."
+            exit 1
+          fi
+
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Setup Gradle
+
+      - name: Install Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
       - name: Create Gradle Wrapper
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
         run: |
-          if [ ! -x ./gradlew ]; then
+          set -euo pipefail
+          if [ ! -f "./gradlew" ]; then
             gradle wrapper --gradle-version 8.11.1
-            chmod +x ./gradlew
           fi
+          chmod +x ./gradlew
+
       - name: Build Debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleDebug --stacktrace
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: SorenWare-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          retention-days: 7
